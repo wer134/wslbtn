@@ -30,7 +30,8 @@ import unicodedata
 from pathlib import Path
 
 SCHEME = "wslbtn"
-TOKEN_RE = re.compile(rf"^{SCHEME}://fire/([A-Za-z0-9_-]{{22}})/?$")
+# '#' 뒤는 툴팁에 실행할 명령을 보여 주기 위한 부분이라 무시한다 (실행은 토큰으로만 결정)
+TOKEN_RE = re.compile(rf"^{SCHEME}://fire/([A-Za-z0-9_-]{{22}})/?(?:#.*)?$", re.S)
 DEFAULT_TTL = 24 * 3600
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "wslbtn"
@@ -126,7 +127,26 @@ def cmd_btn(args):
     style = "\033[1;97;44m" if not args.once else "\033[1;97;41m"
     text = f"{style} {args.label} \033[0m"
     end = "" if args.no_newline else "\n"
-    sys.stdout.write(osc8(f"{SCHEME}://fire/{token}", text) + end)
+    url = f"{SCHEME}://fire/{token}#{tooltip_text(argv)}"
+    sys.stdout.write(osc8(url, text) + end)
+
+
+def tooltip_text(argv, limit=100):
+    """마우스를 올렸을 때 Windows Terminal 툴팁에 보일 명령 (URL의 '#' 뒤).
+
+    클릭하면 이 URL이 Windows 명령줄 인자로 넘어가므로, 인자를 쪼갤 수 있는 따옴표와
+    역슬래시, 그리고 %, 제어 문자, 비ASCII 문자는 퍼센트 인코딩한다.
+    """
+    text = _display(argv)
+    if len(text) > limit:
+        text = text[:limit - 3] + "..."
+    out = []
+    for ch in text:
+        if 0x20 <= ord(ch) < 0x7F and ch not in '"\\%':
+            out.append(ch)
+        else:
+            out.extend(f"%{b:02X}" for b in ch.encode())
+    return "".join(out)
 
 
 # ---------------------------------------------------------------- fire
@@ -166,10 +186,16 @@ def cmd_fire(rest):
     log(f"실행: [{label}] exit={code}")
 
 
+SLOW = 1.0  # 이보다 오래 걸리면 성공해도 걸린 시간을 보여 준다
+
+
 def run_button(button, out, stdin=None):
-    """머리줄 → 명령 실행 → 종료 코드 줄을 out에 쓴다. stdin=None이면 터미널 입력을 물려받는다."""
+    """머리줄 → 명령 실행 → (실패했거나 오래 걸렸을 때만) 꼬리줄을 out에 쓴다.
+
+    stdin=None이면 터미널 입력을 물려받는다.
+    """
     label = button["label"]
-    out.write(f"\033[36m── [{label}] $ {_display(button['argv'])}\033[0m\r\n")
+    out.write(f"\033[1;36m▶ {label}\033[0m \033[2m{_display(button['argv'])}\033[0m\r\n")
     out.flush()
     start = time.monotonic()
     try:
@@ -178,8 +204,11 @@ def run_button(button, out, stdin=None):
     except OSError as e:
         out.write(f"\033[31m실행 실패: {e}\033[0m\r\n")
         code = None
-    color = "32" if code == 0 else "31"
-    out.write(f"\033[{color}m── [{label}] 종료 코드 {code} ({time.monotonic() - start:.1f}s)\033[0m\r\n")
+    elapsed = time.monotonic() - start
+    if code != 0:
+        out.write(f"\033[31m✗ {label} · 종료 코드 {code} ({elapsed:.1f}s)\033[0m\r\n")
+    elif elapsed >= SLOW:
+        out.write(f"\033[2;32m✓ {label} ({elapsed:.1f}s)\033[0m\r\n")
     out.flush()
     return code
 
@@ -468,8 +497,11 @@ using System.Text.RegularExpressions;
 static class WslbtnLaunch {
     const string Args = @"__ARGS__";
     static int Main(string[] a) {
-        if (a.Length != 1 || !Regex.IsMatch(a[0], @"^__SCHEME__://fire/[A-Za-z0-9_-]{22}/?$")) return 2;
-        var psi = new ProcessStartInfo(@"C:\Windows\System32\wsl.exe", Args + " " + a[0]);
+        if (a.Length != 1) return 2;
+        // '#' 뒤(툴팁용 명령 표시)는 버리고 토큰만 넘긴다. 그래서 그 부분에 무엇이 있든 wsl.exe에 닿지 않는다.
+        var m = Regex.Match(a[0], @"^__SCHEME__://fire/([A-Za-z0-9_-]{22})/?(#.*)?$", RegexOptions.Singleline);
+        if (!m.Success) return 2;
+        var psi = new ProcessStartInfo(@"C:\Windows\System32\wsl.exe", Args + " __SCHEME__://fire/" + m.Groups[1].Value);
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
         // 콘솔이 없는 상태에서 표준 입출력이 없으면 wsl.exe가 실패하므로 파이프로 연결하고 버린다.

@@ -38,7 +38,7 @@ class WslbtnTest(unittest.TestCase):
             wslbtn.main(["btn", *args])
         url = buf.getvalue().split("\033]8;;")[1].split("\033\\")[0]
         # 테스트에서는 tty 대신 파일에 출력하게 바꿔 둔다
-        token = url.rsplit("/", 1)[1]
+        token = wslbtn.TOKEN_RE.match(url).group(1)
         p = wslbtn.BUTTONS_DIR / f"{token}.json"
         data = json.loads(p.read_text())
         data["tty"] = str(self.out)
@@ -53,7 +53,8 @@ class WslbtnTest(unittest.TestCase):
         wslbtn.main(["fire", url])
         out = self.out.read_text()
         self.assertIn("hello", out)
-        self.assertIn("종료 코드 0", out)
+        self.assertIn("▶ hi", out)
+        self.assertNotIn("✗", out)  # 빨리 성공하면 꼬리줄 없음
 
     def test_shell_string(self):
         url = self.make("sh", "-s", "echo a | tr a b")
@@ -79,8 +80,20 @@ class WslbtnTest(unittest.TestCase):
         wslbtn.main(["fire", url])
         self.assertEqual(self.out.read_text(), "")
 
+    def test_failure_shows_exit_code(self):
+        url = self.make("bad", "--", "false")
+        wslbtn.main(["fire", url])
+        self.assertIn("✗ bad · 종료 코드 1", self.out.read_text())
+
+    def test_tooltip_shows_command_safely(self):
+        url = self.make("t", "-s", 'echo "hi" 100% C:\\x 안')
+        frag = url.split("#", 1)[1]
+        self.assertEqual(frag, "echo %22hi%22 100%25 C:%5Cx %EC%95%88")
+        wslbtn.main(["fire", url])  # '#' 뒤가 있어도 실행된다
+        self.assertIn("hi", self.out.read_text())
+
     def test_rejects_forged_and_injected(self):
-        url = self.make("x", "--", "touch", "pwned")
+        url = self.make("x", "--", "touch", "pwned").split("#")[0]
         for bad in (["wslbtn://fire/" + "A" * 22],             # 모르는 토큰
                     [url, "--evil"],                           # 인자 끼워넣기
                     [url + '" -o x'],                          # 형식 불일치
@@ -188,14 +201,14 @@ class PromptRedrawTest(PtyBashTest):
         self.read(0.3)
         after = self.fire(url)
         self.assertIn("FIRED", after)
-        self.assertIn("PROMPT> abc", after.split("종료 코드")[-1])
+        self.assertIn("PROMPT> abc", after.split("FIRED")[-1])
         self.assertEqual(self.size(), (40, 120))
 
     def test_leaves_running_program_alone(self):
         url = self.make_button("; sleep 3")
         after = self.fire(url)
         self.assertIn("FIRED", after)
-        self.assertNotIn("PROMPT>", after.split("종료 코드")[-1])
+        self.assertNotIn("PROMPT>", after.split("FIRED")[-1])
         self.assertEqual(self.size(), (40, 120))
 
 
@@ -226,7 +239,7 @@ class MenuTest(PtyBashTest):
 
     def test_click_outside_does_nothing(self):
         os.write(self.fd, b"\033[<0;7;19M\033[<0;50;10M")
-        self.assertNotIn("종료 코드", self.read(0.5))
+        self.assertNotIn("▶", self.read(0.5))
 
     def test_quit_restores_terminal(self):
         os.write(self.fd, b"q")
