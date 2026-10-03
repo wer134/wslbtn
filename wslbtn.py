@@ -4,6 +4,7 @@
     wslbtn install                          # Windows에 wslbtn:// 핸들러 등록 (최초 1회)
     wslbtn btn "재시작" -- systemctl restart app
     wslbtn btn "로그" -s "tail -n 50 app.log | less"
+    wslbtn menu                             # 이 터미널의 버튼을 그냥 클릭/숫자 키로 실행
     wslbtn uninstall
 
 버튼(OSC 8 링크)에는 랜덤 토큰만 들어가고, 실제 명령은 WSL 쪽 상태 디렉토리에
@@ -13,14 +14,19 @@ fire가 토큰을 확인한 뒤 명령을 실행해 출력을 버튼이 찍혔�
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
 import secrets
+import select
 import shutil
+import struct
 import subprocess
 import sys
+import termios
 import time
+import unicodedata
 from pathlib import Path
 
 SCHEME = "wslbtn"
@@ -112,7 +118,9 @@ def cmd_btn(args):
         "cwd": os.getcwd(),
         "env": dict(os.environ),
         "tty": current_tty(),
+        "sid": os.getsid(0),  # 터미널의 셸 (출력 후 프롬프트를 다시 그리게 할 대상)
         "once": args.once,
+        "created": time.time(),
         "expires": time.time() + args.ttl,
     })
     style = "\033[1;97;44m" if not args.once else "\033[1;97;41m"
@@ -145,29 +153,277 @@ def cmd_fire(rest):
         out = open(tty, "a") if tty else None
     except OSError:
         out = None  # 터미널이 닫혔음
+    to_tty = out is not None
     if out is None:
         out = open(LOG_FILE, "a")
         log(f"터미널 {tty} 없음, 출력은 로그로: [{label}]")
 
     with out:
-        out.write(f"\r\n\033[36m── [{label}] $ {_display(button['argv'])}\033[0m\r\n")
-        out.flush()
-        start = time.monotonic()
-        try:
-            code = subprocess.run(button["argv"], cwd=button["cwd"], env=button["env"],
-                                  stdin=subprocess.DEVNULL, stdout=out, stderr=out).returncode
-        except OSError as e:
-            out.write(f"\033[31m실행 실패: {e}\033[0m\r\n")
-            code = None
-        color = "32" if code == 0 else "31"
-        out.write(f"\033[{color}m── [{label}] 종료 코드 {code} ({time.monotonic() - start:.1f}s)\033[0m\r\n")
+        out.write("\r\n")
+        code = run_button(button, out, stdin=subprocess.DEVNULL)
+    if to_tty:
+        redraw_prompt(tty, button.get("sid"))
     log(f"실행: [{label}] exit={code}")
+
+
+def run_button(button, out, stdin=None):
+    """머리줄 → 명령 실행 → 종료 코드 줄을 out에 쓴다. stdin=None이면 터미널 입력을 물려받는다."""
+    label = button["label"]
+    out.write(f"\033[36m── [{label}] $ {_display(button['argv'])}\033[0m\r\n")
+    out.flush()
+    start = time.monotonic()
+    try:
+        code = subprocess.run(button["argv"], cwd=button["cwd"], env=button["env"],
+                              stdin=stdin, stdout=out, stderr=out).returncode
+    except OSError as e:
+        out.write(f"\033[31m실행 실패: {e}\033[0m\r\n")
+        code = None
+    color = "32" if code == 0 else "31"
+    out.write(f"\033[{color}m── [{label}] 종료 코드 {code} ({time.monotonic() - start:.1f}s)\033[0m\r\n")
+    out.flush()
+    return code
+
+
+def redraw_prompt(tty, sid):
+    """셸이 프롬프트에서 대기 중이면 프롬프트(와 입력 중인 내용)를 다시 그리게 한다.
+
+    bash(readline)는 SIGWINCH만으로는 다시 그리지 않고 화면 크기가 실제로 바뀌어야
+    다시 그린다. 그래서 폭을 1칸 줄였다가 되돌린다 (크기가 바뀌면 커널이 SIGWINCH를
+    보낸다). vim 같은 프로그램이 앞에서 돌고 있으면 건드리지 않는다.
+    """
+    if not sid:
+        return
+    try:
+        # /proc/<pid>/stat: comm 뒤로 state ppid pgrp session tty_nr tpgid ...
+        fields = Path(f"/proc/{sid}/stat").read_text().rsplit(")", 1)[1].split()
+        tty_nr, tpgid = int(fields[4]), int(fields[5])
+        if tty_nr != os.stat(tty).st_rdev or tpgid != sid:  # PID 재사용 / 다른 프로그램 실행 중
+            return
+        fd = os.open(tty, os.O_WRONLY | os.O_NOCTTY)
+    except (OSError, ValueError, IndexError):
+        return
+    try:
+        size = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols, xpix, ypix = struct.unpack("HHHH", size)
+        if cols < 2:
+            return
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols - 1, xpix, ypix))
+        time.sleep(0.1)  # 셸이 첫 번째 크기 변경을 처리할 시간 (너무 빠르면 하나로 합쳐짐)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _display(argv):
     if argv[:2] == ["bash", "-c"] and len(argv) == 3:
         return argv[2]
     return " ".join(argv)
+
+
+# ---------------------------------------------------------------- menu
+#
+# Windows Terminal은 OSC 8 링크를 Ctrl+클릭으로만 연다 (설정으로 못 바꿈).
+# 그래서 Neovim처럼 터미널 마우스 모드를 켜고 클릭 좌표를 직접 받아, 메뉴가 떠 있는
+# 동안에는 그냥 클릭으로 버튼을 누를 수 있게 한다.
+
+MOUSE_ON = "\033[?1000h\033[?1006h"   # 클릭 보고 + SGR 좌표 형식
+MOUSE_OFF = "\033[?1000l\033[?1006l"
+MOUSE_RE = re.compile(rb"\033\[<(\d+);(\d+);(\d+)([Mm])")
+KEYS = "123456789"
+
+
+def live_buttons(tty):
+    """이 터미널에서 만든, 아직 유효한 버튼 (최근 것부터). 같은 라벨+명령은 최신 하나만."""
+    if not BUTTONS_DIR.exists():
+        return []
+    now, seen, result = time.time(), set(), []
+    found = []
+    for p in BUTTONS_DIR.glob("*.json"):
+        try:
+            b = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if b.get("tty") == tty and b["expires"] > now:
+            b["token"] = p.stem
+            found.append(b)
+    for b in sorted(found, key=lambda b: b.get("created", 0), reverse=True):
+        key = (b["label"], tuple(b["argv"]))
+        if key not in seen:
+            seen.add(key)
+            result.append(b)
+    return result
+
+
+def cell_width(text):
+    """터미널에서 차지하는 칸 수 (한글 등 전각 문자는 2칸)."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def layout(buttons, cols):
+    """버튼을 터미널 폭에 맞춰 줄 단위로 배치한다.
+
+    반환: [[(시작 열, 끝 열, 버튼 인덱스, 표시 문자열), ...], ...]  (열은 1부터, 끝 포함)
+    """
+    lines, line, col = [], [], 1
+    for i, b in enumerate(buttons):
+        key = KEYS[i] if i < len(KEYS) else " "
+        text = f" {key} {b['label']} "
+        w = cell_width(text)
+        if line and col + w - 1 > cols:
+            lines.append(line)
+            line, col = [], 1
+        line.append((col, col + w - 1, i, text))
+        col += w + 1  # 버튼 사이 한 칸
+    if line:
+        lines.append(line)
+    return lines
+
+
+def hit_test(lines, first_row, x, y):
+    """클릭 좌표(1부터)에 있는 버튼 인덱스. 없으면 None."""
+    i = y - first_row
+    if 0 <= i < len(lines):
+        for start, end, idx, _ in lines[i]:
+            if start <= x <= end:
+                return idx
+    return None
+
+
+class Menu:
+    HINT = "\033[2m클릭 또는 숫자 키로 실행 · q/Esc 종료\033[0m"
+
+    def __init__(self, tty):
+        self.tty = tty
+        self.fd = sys.stdin.fileno()
+        self.out = sys.stdout
+        self.lines, self.first_row, self.buttons = [], 1, []
+        self.height = 1
+
+    # -- 터미널 입출력
+
+    def read_bytes(self, timeout):
+        if select.select([self.fd], [], [], timeout)[0]:
+            return os.read(self.fd, 1024)
+        return b""
+
+    def cursor_row(self):
+        """DSR(ESC[6n)로 커서 행을 물어본다. 그 사이 들어온 다른 입력은 버퍼에 남긴다."""
+        self.out.write("\033[6n")
+        self.out.flush()
+        buf, end = b"", time.monotonic() + 1.0
+        while time.monotonic() < end:
+            buf += self.read_bytes(0.05)
+            m = re.search(rb"\033\[(\d+);(\d+)R", buf)
+            if m:
+                self.pending += buf[:m.start()] + buf[m.end():]
+                return int(m.group(1))
+        self.pending += buf
+        return None
+
+    def render(self):
+        self.buttons = live_buttons(self.tty)
+        cols = shutil.get_terminal_size().columns
+        self.lines = layout(self.buttons, cols)
+        out = []
+        for line in self.lines:
+            row = ""
+            for _, _, idx, text in line:
+                style = "\033[1;97;41m" if self.buttons[idx].get("once") else "\033[1;97;44m"
+                row += f"{style}{text}\033[0m "
+            out.append(row.rstrip())
+        if not self.lines:
+            out.append("\033[2m(이 터미널에서 만든 버튼이 없음)\033[0m")
+        out.append(self.HINT)
+        self.out.write("\r\n".join(out))
+        self.out.flush()
+        row = self.cursor_row()
+        # 커서는 안내 줄(마지막 줄)에 있다
+        self.first_row = (row - len(out) + 1) if row else -1000
+        self.height = len(out)
+
+    def clear(self):
+        """메뉴가 차지한 줄을 지우고 커서를 메뉴 첫 줄 맨 앞에 둔다."""
+        self.out.write(f"\r\033[{self.height - 1}A" if self.height > 1 else "\r")
+        self.out.write("\033[J")
+        self.out.flush()
+
+    # -- 실행
+
+    def fire(self, idx):
+        button = self.buttons[idx]
+        self.out.write(MOUSE_OFF)
+        self.clear()
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        if not button.get("once") or take_button(button["token"]) is not None:
+            run_button(button, self.out)  # 터미널 입력을 물려받아 대화형 명령도 동작
+        self.set_mode()
+        self.render()
+
+    def set_mode(self):
+        mode = termios.tcgetattr(self.fd)
+        mode[3] &= ~(termios.ICANON | termios.ECHO)  # ISIG는 남겨 Ctrl+C 동작
+        mode[6][termios.VMIN], mode[6][termios.VTIME] = 1, 0
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, mode)
+        self.out.write(MOUSE_ON)
+        self.out.flush()
+
+    def handle(self, data):
+        """입력을 처리한다. 종료해야 하면 False."""
+        if os.environ.get("WSLBTN_DEBUG"):
+            log(f"menu 입력 {data!r} / 버튼 첫 행 {self.first_row} / 배치 "
+                f"{[[(a, b, i) for a, b, i, _ in line] for line in self.lines]}")
+        while data:
+            m = MOUSE_RE.match(data)
+            if m:
+                data = data[m.end():]
+                b, x, y, kind = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
+                # 왼쪽 버튼 누름. Shift(4)/Alt(8)/Ctrl(16) 비트는 무시해서 Ctrl+클릭도 받는다
+                if kind == b"M" and b & ~(4 | 8 | 16) == 0:
+                    idx = hit_test(self.lines, self.first_row, x, y)
+                    if idx is not None:
+                        self.fire(idx)
+                continue
+            if data[:1] == b"\033":
+                if len(data) == 1:
+                    return False  # Esc 단독
+                data = data[1:]  # 모르는 이스케이프 시퀀스 앞부분은 버린다
+                continue
+            ch, data = data[:1].decode(errors="ignore"), data[1:]
+            if ch in ("q", "Q"):
+                return False
+            if ch in KEYS and KEYS.index(ch) < len(self.buttons):
+                self.fire(KEYS.index(ch))
+        return True
+
+    def run(self):
+        self.saved = termios.tcgetattr(self.fd)
+        self.pending = b""
+        try:
+            self.set_mode()
+            self.render()
+            while True:
+                data, self.pending = self.pending, b""
+                data += self.read_bytes(None)
+                # Esc 단독인지 시퀀스 시작인지 구분하려고 잠깐 더 기다린다
+                if data.endswith(b"\033"):
+                    data += self.read_bytes(0.05)
+                if not self.handle(data):
+                    break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.out.write(MOUSE_OFF)
+            self.clear()
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+
+def cmd_menu(_args):
+    tty = current_tty()
+    if not tty or not sys.stdin.isatty():
+        sys.exit("wslbtn menu: 터미널에서 실행하세요.")
+    Menu(tty).run()
 
 
 # ---------------------------------------------------------------- install
@@ -311,6 +567,7 @@ def main(argv=None):
     b.add_argument("-n", "--no-newline", action="store_true", help="줄바꿈 없이 출력")
     b.set_defaults(func=cmd_btn)
 
+    sub.add_parser("menu", help="이 터미널의 버튼을 그냥 클릭(또는 숫자 키)으로 누르는 메뉴").set_defaults(func=cmd_menu)
     sub.add_parser("install", help="Windows에 wslbtn:// 핸들러 등록").set_defaults(func=cmd_install)
     sub.add_parser("uninstall", help="핸들러 제거").set_defaults(func=cmd_uninstall)
 
